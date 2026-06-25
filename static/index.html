@@ -3,113 +3,156 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ExpertRoom — 专家头脑风暴</title>
-  <link rel="stylesheet" href="/static/style.css?v=2" />
+  <title>ExpertRoom</title>
+  <link rel="stylesheet" href="/static/style.css?v=3" />
 </head>
 <body>
 
-<!-- ── 顶栏 ─────────────────────────────────── -->
-<div id="topbar">
-  <h1>ExpertRoom</h1>
-  <div id="room-meta">
-    <div id="room-topic">— 暂无进行中的讨论 —</div>
-    <div id="room-goal"></div>
+<!-- ── Top bar ──────────────────────────────────────────────── -->
+<header id="topbar">
+  <div id="topbar-left">
+    <span id="app-name">ExpertRoom</span>
+    <span id="room-title">— 暂无讨论 —</span>
+    <span id="room-status-badge" class="badge badge-idle">待机</span>
   </div>
-  <div id="progress-bar-wrap">
-    <div id="progress-label">进度</div>
-    <div id="progress-bar"><div id="progress-fill"></div></div>
+  <div id="topbar-controls">
+    <button id="btn-start"     class="ctrl-btn" disabled>▶ 开始</button>
+    <button id="btn-pause"     class="ctrl-btn" disabled>⏸ 暂停</button>
+    <button id="btn-resume"    class="ctrl-btn" disabled>▶ 继续</button>
+    <button id="btn-stop"      class="ctrl-btn btn-danger" disabled>■ 停止</button>
+    <button id="btn-summarize" class="ctrl-btn" disabled>📋 总结</button>
+    <button id="btn-new-room"  class="ctrl-btn btn-primary">＋ 新讨论</button>
+    <button id="btn-manage-agents" class="ctrl-btn btn-ghost">⚙ 管理专家</button>
   </div>
-  <button id="new-room-btn">＋ 新讨论</button>
-  <button id="manage-agents-btn">⚙ 管理智能体</button>
-</div>
+</header>
 
-<!-- ── 主布局 ─────────────────────────────────── -->
+<!-- ── Main layout ──────────────────────────────────────────── -->
 <div id="layout">
 
-  <!-- 侧边栏：agent 状态 + 历史房间 -->
+  <!-- Left: room list + participants -->
   <aside id="sidebar">
-    <h2>参与者</h2>
-    <div id="agent-list"></div>
-    <div id="room-list-section">
-      <h2>历史讨论</h2>
+    <section id="participants-section">
+      <h3>参与专家</h3>
+      <div id="agent-list"></div>
+    </section>
+    <section id="room-list-section">
+      <h3>历史讨论</h3>
       <div id="history-rooms"></div>
-    </div>
+    </section>
   </aside>
 
-  <!-- 主区域：消息流 + 输入框 -->
+  <!-- Center: message timeline -->
   <div id="main-area">
     <div id="messages">
-      <div class="system-msg" style="margin-top:60px">
-        点击右上角「＋ 新讨论」开启一个头脑风暴
-      </div>
+      <div class="empty-hint">点击「＋ 新讨论」开启头脑风暴</div>
     </div>
     <div id="input-area">
+      <select id="target-agent-select" disabled title="发言对象">
+        <option value="">全体专家</option>
+      </select>
       <textarea id="user-input"
-                placeholder="随时插话……（Enter 发送，Shift+Enter 换行）"
-                rows="1"
-                disabled></textarea>
+                placeholder="随时插话、引导方向……（Enter 发送，Shift+Enter 换行）"
+                rows="1" disabled></textarea>
       <button id="send-btn" disabled>发送</button>
     </div>
   </div>
+
+  <!-- Right: goal, progress, expert status -->
+  <aside id="right-panel">
+    <section id="goal-section">
+      <h3>讨论目标</h3>
+      <div id="goal-text" class="dim">—</div>
+    </section>
+
+    <section id="progress-section">
+      <h3>进度检查</h3>
+      <div id="progress-bar-wrap">
+        <div id="progress-bar"><div id="progress-fill"></div></div>
+        <span id="progress-label">0%</span>
+      </div>
+      <ul id="checklist">
+        <li id="ck-problem"><span class="ck-icon">○</span> 问题已定义</li>
+        <li id="ck-solutions"><span class="ck-icon">○</span> 方案 <span id="ck-solutions-count">0</span> 个</li>
+        <li id="ck-risks"><span class="ck-icon">○</span> 风险已识别</li>
+        <li id="ck-tradeoffs"><span class="ck-icon">○</span> 权衡已讨论</li>
+        <li id="ck-actions"><span class="ck-icon">○</span> 下一步已就绪</li>
+        <li id="ck-summary"><span class="ck-icon">○</span> 总结已生成</li>
+      </ul>
+    </section>
+
+    <section id="adapter-health-section">
+      <h3>后端状态</h3>
+      <div id="adapter-health-list"></div>
+    </section>
+  </aside>
 </div>
 
-<!-- ── 新建房间 Modal ─────────────────────────── -->
-<div id="modal-overlay">
-  <div id="modal">
-    <h2>开启新讨论</h2>
+<!-- ── New room modal ────────────────────────────────────────── -->
+<div id="modal-overlay" class="modal-overlay hidden">
+  <div id="modal" class="modal">
+    <div class="modal-header">
+      <h2>开启新讨论</h2>
+      <button class="modal-close" id="modal-close">✕</button>
+    </div>
 
     <div class="form-group">
       <label>话题 *</label>
       <input id="topic-input" type="text"
-             placeholder="例如：AI agent 应该如何设计记忆系统？" />
+             placeholder="例如：如何设计 AI agent 的记忆系统？" />
     </div>
-
     <div class="form-group">
-      <label>目标（可选）</label>
+      <label>期望产出（可选）</label>
       <input id="goal-input" type="text"
              placeholder="例如：产出 5 个可执行 idea" />
     </div>
-
     <div class="form-group">
-      <label>参与者</label>
+      <label>讨论模式</label>
+      <select id="mode-select">
+        <option value="moderated">主持人调度（推荐）— 由 AI 主持人选择下一个发言人</option>
+        <option value="round_robin">轮流发言 — 专家依次发言，结构清晰</option>
+        <option value="panel">圆桌并行 — 所有专家同时回答，信息量大</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>参与专家</label>
       <div id="agent-checkboxes"></div>
     </div>
 
     <div class="modal-actions">
       <button class="btn-cancel" id="modal-cancel">取消</button>
-      <button class="btn-create" id="modal-create">开始讨论</button>
+      <button class="btn-create" id="modal-create">创建讨论</button>
     </div>
   </div>
 </div>
 
-<!-- ── Agent 管理 Modal ───────────────────────── -->
-<div id="agent-modal-overlay">
-  <div id="agent-modal">
-    <div id="agent-modal-header">
-      <h2 id="agent-modal-title">管理智能体</h2>
-      <button id="agent-modal-close">✕</button>
+<!-- ── Agent manager modal ───────────────────────────────────── -->
+<div id="agent-modal-overlay" class="modal-overlay hidden">
+  <div id="agent-modal" class="modal modal-wide">
+    <div class="modal-header">
+      <h2 id="agent-modal-title">管理专家智能体</h2>
+      <button class="modal-close" id="agent-modal-close">✕</button>
     </div>
 
-    <!-- 列表视图 -->
+    <!-- List view -->
     <div id="agent-list-view">
       <div id="agent-cards"></div>
-      <button id="add-agent-btn" class="btn-create">＋ 新建智能体</button>
+      <button id="add-agent-btn" class="btn-create">＋ 新建专家</button>
     </div>
 
-    <!-- 编辑/新建表单 -->
+    <!-- Edit / create form -->
     <div id="agent-form-view" style="display:none">
       <div class="form-group">
-        <label>ID（唯一标识，仅字母数字下划线）</label>
-        <input id="af-id" type="text" placeholder="例如：lawyer" />
-        <small id="af-id-note" style="color:var(--text-dim);font-size:11px"></small>
+        <label>ID（唯一标识，仅字母/数字/下划线）</label>
+        <input id="af-id" type="text" placeholder="如 lawyer" />
+        <small id="af-id-note" class="dim"></small>
       </div>
       <div class="form-row">
         <div class="form-group" style="flex:1">
           <label>名称（显示用）</label>
-          <input id="af-name" type="text" placeholder="例如：律师" />
+          <input id="af-name" type="text" placeholder="如 律师" />
         </div>
         <div class="form-group" style="width:80px">
-          <label>头像 Emoji</label>
+          <label>头像</label>
           <input id="af-avatar" type="text" placeholder="⚖️" maxlength="4" />
         </div>
       </div>
@@ -125,32 +168,32 @@
       </div>
       <div class="form-group">
         <label>身份定位</label>
-        <input id="af-identity" type="text" placeholder="例如：法律顾问，擅长合规与风险评估" />
+        <input id="af-identity" type="text" placeholder="如 法律顾问，擅长合规与风险评估" />
       </div>
       <div class="form-group">
         <label>专业领域</label>
-        <input id="af-expertise" type="text" placeholder="例如：合同法、知识产权、公司治理" />
+        <input id="af-expertise" type="text" placeholder="如 合同法、知识产权、公司治理" />
       </div>
       <div class="form-group">
         <label>性格特征（逗号分隔）</label>
-        <input id="af-traits" type="text" placeholder="例如：严谨, 保守, 注重细节" />
+        <input id="af-traits" type="text" placeholder="如 严谨, 保守, 注重细节" />
       </div>
       <div class="form-group">
         <label>说话风格</label>
-        <input id="af-tone" type="text" placeholder="例如：引用法条，喜欢追问「这件事合规吗」" />
+        <input id="af-tone" type="text" placeholder="如 引用法条，喜欢追问「这件事合规吗」" />
       </div>
       <div class="form-group">
         <label>公开目标（逗号分隔）</label>
-        <input id="af-goals" type="text" placeholder="例如：识别法律风险, 提供合规建议" />
+        <input id="af-goals" type="text" placeholder="如 识别法律风险, 提供合规建议" />
       </div>
       <div class="form-group">
-        <label>长期记忆 / 固有认知（逗号分隔）</label>
-        <input id="af-memory" type="text" placeholder="例如：大多数创业失败源于合规疏忽" />
+        <label>长期认知（逗号分隔）</label>
+        <input id="af-memory" type="text" placeholder="如 大多数创业失败源于合规疏忽" />
       </div>
       <div class="form-group">
         <label>
           <input id="af-enabled" type="checkbox" checked style="margin-right:6px" />
-          启用此智能体
+          启用此专家
         </label>
       </div>
       <div class="modal-actions">
@@ -161,6 +204,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=2"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>

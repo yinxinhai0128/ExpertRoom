@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlmodel import Session, select
 from sse_starlette.sse import EventSourceResponse
 
@@ -32,14 +35,14 @@ def on_startup() -> None:
     init_db()
 
 
-# ── 静态页面 ──────────────────────────────────────────────────
+# ── Static ────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     return (_static / "index.html").read_text(encoding="utf-8")
 
 
-# ── 健康检查 ──────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health(db: Session = Depends(get_session)):
@@ -49,13 +52,48 @@ def health(db: Session = Depends(get_session)):
     except Exception:
         db_ok = False
     agents = load_all_agents()
-    return {
-        "status": "ok" if db_ok else "error",
-        "agents_loaded": len(agents),
+    return {"status": "ok" if db_ok else "error", "agents_loaded": len(agents)}
+
+
+@app.get("/api/adapters/health")
+def adapters_health():
+    """Return availability info for each adapter backend."""
+    config = get_config()
+    results: dict = {}
+
+    # mock is always available
+    results["mock"] = {"available": True, "reason": "always available", "command": None}
+
+    # CLI-based adapters: check if command is on PATH
+    cli_backends = {
+        "claude":   config.get("adapters", {}).get("claude",   {}).get("command", "claude.CMD"),
+        "codex":    config.get("adapters", {}).get("codex",    {}).get("command", "codex"),
+        "hermes":   config.get("adapters", {}).get("hermes",   {}).get("command", "hermes.exe"),
+        "openclaw": None,  # openclaw uses WSL, checked separately
     }
 
+    for backend, cmd in cli_backends.items():
+        if backend == "openclaw":
+            # openclaw needs wsl.exe + the configured distro
+            wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+            distro = config.get("adapters", {}).get("openclaw", {}).get("distro", "")
+            if wsl and distro:
+                results[backend] = {"available": True, "reason": "wsl found", "command": wsl}
+            else:
+                reason = "wsl not found" if not wsl else f"distro not configured"
+                results[backend] = {"available": False, "reason": reason, "command": wsl}
+        else:
+            found = shutil.which(cmd) if cmd else None
+            results[backend] = {
+                "available": bool(found),
+                "reason": "ok" if found else f"command not found: {cmd}",
+                "command": found,
+            }
 
-# ── 配置 / Agent ──────────────────────────────────────────────
+    return results
+
+
+# ── Config / Agents ───────────────────────────────────────────
 
 @app.get("/api/config")
 def read_config():
@@ -73,12 +111,13 @@ def list_agents():
     return {aid: a.to_dict() for aid, a in agents.items() if a.enabled}
 
 
-# ── 房间 CRUD ──────────────────────────────────────────────────
+# ── Room CRUD ─────────────────────────────────────────────────
 
 class CreateRoomRequest(BaseModel):
     topic: str
     goal: str = ""
     agent_ids: list[str] = []
+    discussion_mode: str = "moderated"
 
 
 @app.post("/api/rooms", status_code=201)
@@ -86,6 +125,10 @@ def create_room(payload: CreateRoomRequest, db: Session = Depends(get_session)):
     topic = payload.topic.strip()
     if not topic:
         raise HTTPException(400, "topic cannot be empty")
+
+    mode = payload.discussion_mode
+    if mode not in ("round_robin", "moderated", "panel"):
+        raise HTTPException(400, "discussion_mode must be round_robin, moderated, or panel")
 
     all_agents = load_all_agents()
     config = get_config()
@@ -99,21 +142,19 @@ def create_room(payload: CreateRoomRequest, db: Session = Depends(get_session)):
         topic=topic,
         goal=payload.goal.strip(),
         agent_ids=",".join(valid_ids),
-        status="running",
+        status="ready",
+        discussion_mode=mode,
     )
     db.add(room)
     db.commit()
     db.refresh(room)
-    return {"id": room.id, "topic": room.topic, "goal": room.goal,
-            "agent_ids": valid_ids, "status": room.status}
+    return _room_dict(room)
 
 
 @app.get("/api/rooms")
 def list_rooms(db: Session = Depends(get_session)):
     rooms = list(db.exec(select(Room).order_by(Room.created_at.desc()).limit(20)))
-    return [{"id": r.id, "topic": r.topic, "goal": r.goal,
-             "status": r.status, "turn_count": r.turn_count,
-             "created_at": r.created_at.isoformat()} for r in rooms]
+    return [_room_dict(r) for r in rooms]
 
 
 @app.get("/api/rooms/{room_id}")
@@ -121,9 +162,20 @@ def get_room(room_id: int, db: Session = Depends(get_session)):
     room = db.get(Room, room_id)
     if not room:
         raise HTTPException(404, "room not found")
-    return {"id": room.id, "topic": room.topic, "goal": room.goal,
-            "agent_ids": room.agent_ids.split(","),
-            "status": room.status, "turn_count": room.turn_count}
+    return _room_dict(room)
+
+
+def _room_dict(room: Room) -> dict:
+    return {
+        "id": room.id,
+        "topic": room.topic,
+        "goal": room.goal,
+        "agent_ids": [a for a in room.agent_ids.split(",") if a],
+        "status": room.status,
+        "discussion_mode": getattr(room, "discussion_mode", "panel"),
+        "turn_count": room.turn_count,
+        "created_at": room.created_at.isoformat(),
+    }
 
 
 @app.get("/api/rooms/{room_id}/messages")
@@ -133,28 +185,142 @@ def get_messages(room_id: int, db: Session = Depends(get_session)):
     ))
     return [{"id": m.id, "agent_id": m.agent_id, "agent_name": m.agent_name,
              "avatar": m.agent_avatar, "message_type": m.message_type,
-             "content": m.content, "tool_name": m.tool_name,
-             "created_at": m.created_at.isoformat()} for m in msgs]
+             "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
 
 
 @app.get("/api/rooms/{room_id}/artifacts")
 def get_artifacts(room_id: int, db: Session = Depends(get_session)):
-    arts = list(db.exec(
-        select(Artifact).where(Artifact.room_id == room_id)
-    ))
+    arts = list(db.exec(select(Artifact).where(Artifact.room_id == room_id)))
     return [{"id": a.id, "artifact_type": a.artifact_type,
              "filename": a.filename, "content": a.content} for a in arts]
 
 
-# ── SSE 讨论流 ────────────────────────────────────────────────
+# ── Room Lifecycle ────────────────────────────────────────────
+
+_STARTABLE = {"ready", "running", "paused"}
+_ACTIVE    = {"running", "paused"}
+
+
+@app.post("/api/rooms/{room_id}/start")
+def start_room(room_id: int, db: Session = Depends(get_session)):
+    """Mark room as ready to stream. Actual discussion starts when client connects SSE."""
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    if room.status not in _STARTABLE:
+        raise HTTPException(400, f"cannot start room with status '{room.status}'")
+    if room.status == "paused":
+        # resume handled by /resume
+        pass
+    return {"ok": True, "stream_url": f"/api/rooms/{room_id}/stream"}
+
+
+@app.post("/api/rooms/{room_id}/pause")
+async def pause_room(room_id: int, db: Session = Depends(get_session)):
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    session = get_session_if_exists(room_id)
+    if session:
+        session.pause()
+    room.status = "paused"
+    room.updated_at = datetime.utcnow()
+    db.add(room)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/rooms/{room_id}/resume")
+async def resume_room(room_id: int, db: Session = Depends(get_session)):
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    if room.status not in ("paused",):
+        raise HTTPException(400, f"room is not paused (status: {room.status})")
+    room.status = "running"
+    room.updated_at = datetime.utcnow()
+    db.add(room)
+    db.commit()
+    session = get_session_if_exists(room_id)
+    if session:
+        session.resume()
+    return {"ok": True, "stream_url": f"/api/rooms/{room_id}/stream"}
+
+
+@app.post("/api/rooms/{room_id}/stop")
+async def stop_room(room_id: int, db: Session = Depends(get_session)):
+    session = get_session_if_exists(room_id)
+    if session:
+        session.stop()
+    room = db.get(Room, room_id)
+    if room:
+        room.status = "done"
+        room.updated_at = datetime.utcnow()
+        db.add(room)
+        db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/rooms/{room_id}/synthesize")
+async def synthesize_room(room_id: int, db: Session = Depends(get_session)):
+    """Generate (or regenerate) the summary artifact from stored messages."""
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+
+    msgs = list(db.exec(
+        select(Message).where(Message.room_id == room_id).order_by(Message.seq.asc())
+    ))
+    history = [
+        {"agent_id": m.agent_id, "agent_name": m.agent_name,
+         "message_type": m.message_type, "content": m.content}
+        for m in msgs
+    ]
+
+    from app.room_session import synthesize_from_history
+    content = await synthesize_from_history(room.topic, room.goal or "", history)
+
+    # upsert artifact
+    existing = db.exec(
+        select(Artifact).where(
+            Artifact.room_id == room_id,
+            Artifact.artifact_type == "report"
+        )
+    ).first()
+    if existing:
+        existing.content = content
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        artifact = existing
+    else:
+        artifact = Artifact(
+            room_id=room_id,
+            artifact_type="report",
+            filename=f"room_{room_id}_summary.md",
+            content=content,
+        )
+        db.add(artifact)
+        db.commit()
+        db.refresh(artifact)
+
+    room.status = "done"
+    room.updated_at = datetime.utcnow()
+    db.add(room)
+    db.commit()
+
+    return {"artifact_id": artifact.id, "content": content}
+
+
+# ── SSE Stream ────────────────────────────────────────────────
 
 @app.get("/api/rooms/{room_id}/stream")
 async def stream_room(room_id: int, db: Session = Depends(get_session)):
     room = db.get(Room, room_id)
     if not room:
         raise HTTPException(404, "room not found")
-    if room.status == "done":
-        raise HTTPException(400, "room already done")
+    if room.status not in _STARTABLE:
+        raise HTTPException(400, f"room status '{room.status}' cannot be streamed")
 
     session = RoomSession(room_id, db)
     _sessions[room_id] = session
@@ -172,10 +338,11 @@ async def stream_room(room_id: int, db: Session = Depends(get_session)):
     return EventSourceResponse(generator())
 
 
-# ── 用户插话 ──────────────────────────────────────────────────
+# ── Inject ────────────────────────────────────────────────────
 
 class InjectRequest(BaseModel):
     content: str
+    target_agent_id: str = ""
 
 
 @app.post("/api/rooms/{room_id}/inject")
@@ -184,25 +351,29 @@ async def inject_message(room_id: int, payload: InjectRequest,
     content = payload.content.strip()
     if not content:
         raise HTTPException(400, "content cannot be empty")
-    session = get_session_if_exists(room_id)
-    if session is None:
-        raise HTTPException(404, "no active session for this room — start stream first")
-    await session.inject_user_message(content)
-    return {"ok": True}
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    if room.status == "done":
+        raise HTTPException(400, "room is already done")
 
-
-# ── 停止讨论 ──────────────────────────────────────────────────
-
-@app.post("/api/rooms/{room_id}/stop")
-async def stop_room(room_id: int, db: Session = Depends(get_session)):
     session = get_session_if_exists(room_id)
     if session:
-        session.stop()
-    room = db.get(Room, room_id)
-    if room:
-        room.status = "done"
-        db.add(room)
+        # Active session: let it save to DB (avoids double-save)
+        await session.inject_user_message(content)
+    else:
+        # No active session: save directly so message persists for next resume
+        seq_result = db.exec(
+            select(func.max(Message.seq)).where(Message.room_id == room_id)
+        ).one()
+        next_seq = (seq_result or 0) + 1
+        db.add(Message(
+            room_id=room_id, seq=next_seq,
+            agent_id="user", agent_name="你", agent_avatar="🧑",
+            message_type="text", content=content,
+        ))
         db.commit()
+
     return {"ok": True}
 
 
@@ -226,7 +397,6 @@ class AgentPayload(BaseModel):
 
 
 def _agent_to_dict_full(agent_id: str) -> dict:
-    """加载 YAML 原始数据，用于编辑器回显。"""
     import yaml
     path = _AGENTS_DIR / f"{agent_id}.yaml"
     if not path.exists():
@@ -246,18 +416,10 @@ def _write_agent_yaml(agent_id: str, payload: AgentPayload) -> None:
         "enabled": payload.enabled,
         "identity": payload.identity,
         "expertise": payload.expertise,
-        "personality": {
-            "traits": payload.traits,
-        },
-        "speaking_style": {
-            "tone": payload.tone,
-        },
-        "goals": {
-            "public": payload.goals,
-        },
-        "memory": {
-            "long_term": payload.long_term,
-        },
+        "personality": {"traits": payload.traits},
+        "speaking_style": {"tone": payload.tone},
+        "goals": {"public": payload.goals},
+        "memory": {"long_term": payload.long_term},
     }
     path = _AGENTS_DIR / f"{agent_id}.yaml"
     with open(path, "w", encoding="utf-8") as f:
@@ -276,7 +438,7 @@ def get_agent_detail(agent_id: str):
 @app.post("/api/agents", status_code=201)
 def create_agent(agent_id: str, payload: AgentPayload):
     if not agent_id.isidentifier():
-        raise HTTPException(400, "agent_id must be a valid identifier (letters/digits/underscore)")
+        raise HTTPException(400, "agent_id must be a valid identifier")
     path = _AGENTS_DIR / f"{agent_id}.yaml"
     if path.exists():
         raise HTTPException(409, f"agent '{agent_id}' already exists")
@@ -307,7 +469,7 @@ def delete_agent(agent_id: str):
     return {"ok": True}
 
 
-# ── Artifact 下载 ─────────────────────────────────────────────
+# ── Artifact Download ─────────────────────────────────────────
 
 @app.get("/api/artifacts/{artifact_id}/download")
 def download_artifact(artifact_id: int, db: Session = Depends(get_session)):

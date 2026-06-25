@@ -10,8 +10,9 @@ class Room(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     topic: str
     goal: str = ""
-    agent_ids: str = ""          # 逗号分隔的 agent id 列表
-    status: str = "running"      # running | done | error
+    agent_ids: str = ""           # comma-separated agent id list
+    status: str = "ready"         # draft|ready|running|paused|synthesizing|done|failed
+    discussion_mode: str = "moderated"  # round_robin|moderated|panel
     turn_count: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -20,22 +21,22 @@ class Room(SQLModel, table=True):
 class Message(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     room_id: int = Field(index=True)
-    seq: int = 0                 # 消息序号，便于前端排序
-    agent_id: str                # agent id，用户为 "user"，系统为 "system"
+    seq: int = 0
+    agent_id: str
     agent_name: str
     agent_avatar: str = ""
-    message_type: str = "text"   # text | tool_call | tool_result | system | artifact
+    message_type: str = "text"    # text | system | artifact
     content: str = ""
     tool_name: Optional[str] = None
-    tool_input: Optional[str] = None   # JSON string
-    tool_output: Optional[str] = None  # JSON string
+    tool_input: Optional[str] = None
+    tool_output: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class Artifact(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     room_id: int = Field(index=True)
-    artifact_type: str = "text"  # text | code | skill | report | data
+    artifact_type: str = "text"   # text | code | report | data
     filename: str = ""
     content: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)

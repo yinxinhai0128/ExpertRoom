@@ -1,607 +1,649 @@
-'use strict';
-
-// ── 状态 ──────────────────────────────────────────────────────
+/* ── State ────────────────────────────────────────────────────── */
 let currentRoomId = null;
-let agentsCache = {};
-let activeSSE = null;
-let thinkingEl = null;
+let currentRoomStatus = null;
+let eventSource = null;
+let allAgents = {};
+let adapterHealth = {};
 
-const $ = id => document.getElementById(id);
+/* ── Bootstrap ───────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', () => {
+  loadAdapterHealth();
+  loadAgents();
+  loadRoomList();
 
-// ── 初始化 ────────────────────────────────────────────────────
-async function init() {
-  await loadConfig();
-  await loadHistoryRooms();
+  $('btn-new-room').addEventListener('click', openNewRoomModal);
+  $('btn-manage-agents').addEventListener('click', openAgentManager);
+  $('btn-start').addEventListener('click', startDiscussion);
+  $('btn-pause').addEventListener('click', pauseDiscussion);
+  $('btn-resume').addEventListener('click', resumeDiscussion);
+  $('btn-stop').addEventListener('click', stopDiscussion);
+  $('btn-summarize').addEventListener('click', summarizeDiscussion);
 
-  $('new-room-btn').addEventListener('click', openModal);
-  $('modal-cancel').addEventListener('click', closeModal);
+  $('modal-cancel').addEventListener('click', closeNewRoomModal);
+  $('modal-close').addEventListener('click', closeNewRoomModal);
   $('modal-create').addEventListener('click', createRoom);
-  $('send-btn').addEventListener('click', sendUserMessage);
-  $('user-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendUserMessage();
-    }
-  });
-  $('user-input').addEventListener('input', autoResize);
 
-  // Agent 管理器
-  $('manage-agents-btn').addEventListener('click', openAgentManager);
   $('agent-modal-close').addEventListener('click', closeAgentManager);
-  $('agent-modal-overlay').addEventListener('click', e => {
-    if (e.target === $('agent-modal-overlay')) closeAgentManager();
-  });
   $('add-agent-btn').addEventListener('click', openNewAgent);
-  $('af-cancel').addEventListener('click', showAgentListView);
+  $('af-cancel').addEventListener('click', showAgentList);
   $('af-save').addEventListener('click', saveAgent);
-}
 
-function autoResize() {
-  const ta = $('user-input');
-  ta.style.height = 'auto';
-  ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
-}
-
-// ── API helpers ───────────────────────────────────────────────
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
+  $('send-btn').addEventListener('click', sendMessage);
+  $('user-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
-  if (!res.ok) {
-    let msg = await res.text();
-    try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
-    throw new Error(msg);
+  $('user-input').addEventListener('input', function() { autoResize(this); });
+});
+
+function $(id) { return document.getElementById(id); }
+
+/* ── Adapter health ──────────────────────────────────────────── */
+async function loadAdapterHealth() {
+  try {
+    const r = await fetch('/api/adapters/health');
+    adapterHealth = await r.json();
+    renderAdapterHealth();
+  } catch { /* silent */ }
+}
+
+function renderAdapterHealth() {
+  const el = $('adapter-health-list');
+  el.innerHTML = '';
+  for (const [name, info] of Object.entries(adapterHealth)) {
+    const row = document.createElement('div');
+    row.className = 'health-row';
+    row.innerHTML =
+      `<span class="health-dot ${info.available ? 'dot-ok' : 'dot-err'}"></span>` +
+      `<span class="health-name">${name}</span>` +
+      (!info.available
+        ? `<span class="health-warn" title="${escAttr(info.reason)}">⚠</span>`
+        : '');
+    el.appendChild(row);
   }
-  return res.json();
 }
 
-function esc(s) {
-  return String(s || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+/* ── Agents ──────────────────────────────────────────────────── */
+async function loadAgents() {
+  try {
+    const r = await fetch('/api/agents');
+    allAgents = await r.json();
+  } catch { /* silent */ }
 }
 
-// ── 配置加载 ──────────────────────────────────────────────────
-async function loadConfig() {
-  const data = await api('/api/config');
-  agentsCache = data.agents || {};
+function renderRoomAgentSidebar(participants) {
+  const el = $('agent-list');
+  el.innerHTML = '';
+  const ids = Object.keys(participants).length > 0
+    ? Object.keys(participants)
+    : Object.keys(allAgents);
+  if (!ids.length) { el.innerHTML = '<div class="dim">暂无专家</div>'; return; }
+  ids.forEach(aid => {
+    const a = participants[aid] || allAgents[aid];
+    if (!a) return;
+    const row = document.createElement('div');
+    row.className = 'agent-row';
+    row.id = `agent-row-${aid}`;
+    row.innerHTML =
+      `<span class="agent-avatar">${a.avatar || '🤖'}</span>` +
+      `<div class="agent-row-info">` +
+        `<span class="agent-row-name">${escHtml(a.name)}</span>` +
+        `<span class="agent-row-status dim" id="agent-status-${aid}">待机</span>` +
+      `</div>`;
+    el.appendChild(row);
+  });
 }
 
-// ── Modal ─────────────────────────────────────────────────────
-function openModal() {
-  // 渲染 agent 复选框
-  const wrap = $('agent-checkboxes');
-  wrap.innerHTML = '';
-  for (const [id, a] of Object.entries(agentsCache)) {
-    const chip = document.createElement('div');
-    chip.className = 'agent-checkbox selected';
-    chip.dataset.id = id;
-    chip.innerHTML = `${esc(a.avatar || '🤖')} ${esc(a.name)}`;
-    chip.addEventListener('click', () => chip.classList.toggle('selected'));
-    wrap.appendChild(chip);
-  }
+function updateAgentStatus(agentId, status, cls) {
+  const el = $(`agent-status-${agentId}`);
+  if (!el) return;
+  el.textContent = status;
+  el.className = `agent-row-status ${cls || ''}`;
+}
+
+/* ── Room list ───────────────────────────────────────────────── */
+async function loadRoomList() {
+  try {
+    const r = await fetch('/api/rooms');
+    const rooms = await r.json();
+    renderRoomList(rooms);
+  } catch { /* silent */ }
+}
+
+function renderRoomList(rooms) {
+  const el = $('history-rooms');
+  el.innerHTML = '';
+  if (!rooms.length) { el.innerHTML = '<div class="dim">暂无记录</div>'; return; }
+  rooms.forEach(room => {
+    const item = document.createElement('div');
+    item.className = 'room-item' + (room.id === currentRoomId ? ' active' : '');
+    item.innerHTML =
+      `<div class="room-item-topic">${escHtml(room.topic)}</div>` +
+      `<div class="room-item-meta">` +
+        `<span class="badge badge-${statusClass(room.status)}">${statusLabel(room.status)}</span>` +
+        `<span class="dim">${room.turn_count} 轮</span>` +
+      `</div>`;
+    item.addEventListener('click', () => openRoom(room.id));
+    el.appendChild(item);
+  });
+}
+
+function statusClass(s) {
+  const map = { ready:'idle', running:'running', paused:'paused',
+                synthesizing:'running', done:'done', failed:'err', error:'err' };
+  return map[s] || 'idle';
+}
+function statusLabel(s) {
+  const map = { ready:'待开始', running:'进行中', paused:'已暂停',
+                synthesizing:'综合中', done:'已完成', failed:'失败', error:'错误' };
+  return map[s] || s;
+}
+
+/* ── Open existing room ──────────────────────────────────────── */
+async function openRoom(roomId) {
+  try {
+    const r = await fetch(`/api/rooms/${roomId}`);
+    if (!r.ok) return;
+    const room = await r.json();
+    currentRoomId = room.id;
+    currentRoomStatus = room.status;
+    updateRoomMeta(room);
+
+    const mr = await fetch(`/api/rooms/${roomId}/messages`);
+    const msgs = await mr.json();
+    clearMessages();
+    msgs.forEach(m => appendHistoryMessage(m));
+
+    buildTargetAgentSelect(room.agent_ids);
+
+    if (room.status === 'done') {
+      const ar = await fetch(`/api/rooms/${roomId}/artifacts`);
+      const arts = await ar.json();
+      const report = arts.find(a => a.artifact_type === 'report');
+      if (report) renderArtifact(report);
+    }
+
+    updateControlsForStatus(room.status);
+    loadRoomList();
+  } catch { /* silent */ }
+}
+
+/* ── New room modal ──────────────────────────────────────────── */
+function openNewRoomModal() {
+  const container = $('agent-checkboxes');
+  container.innerHTML = '';
+  Object.entries(allAgents).forEach(([aid, a]) => {
+    const health = adapterHealth[a.backend];
+    const unavail = health && !health.available;
+    const label = document.createElement('label');
+    label.className = 'agent-check-label' + (unavail ? ' agent-unavail' : '');
+    label.innerHTML =
+      `<input type="checkbox" value="${aid}" ${unavail ? '' : 'checked'} />` +
+      `<span>${a.avatar || '🤖'} ${escHtml(a.name)}</span>` +
+      (a.identity ? `<span class="dim">${escHtml(a.identity)}</span>` : '') +
+      (unavail
+        ? `<span class="warn-tag" title="${escAttr(health.reason)}">⚠ ${a.backend} 不可用</span>`
+        : '');
+    container.appendChild(label);
+  });
   $('topic-input').value = '';
   $('goal-input').value = '';
-  $('modal-overlay').classList.add('open');
-  $('topic-input').focus();
+  $('mode-select').value = 'moderated';
+  showModal('modal-overlay');
 }
-
-function closeModal() {
-  $('modal-overlay').classList.remove('open');
-}
+function closeNewRoomModal() { hideModal('modal-overlay'); }
 
 async function createRoom() {
   const topic = $('topic-input').value.trim();
   if (!topic) { alert('请输入话题'); return; }
-
-  const goal = $('goal-input').value.trim();
-  const selectedIds = [...$('agent-checkboxes').querySelectorAll('.selected')]
-    .map(el => el.dataset.id);
-
-  const btn = $('modal-create');
-  btn.disabled = true;
-  btn.textContent = '创建中…';
+  const agentIds = Array.from(
+    document.querySelectorAll('#agent-checkboxes input:checked')
+  ).map(cb => cb.value);
+  if (!agentIds.length) { alert('请至少选择一位专家'); return; }
 
   try {
-    const room = await api('/api/rooms', {
+    const r = await fetch('/api/rooms', {
       method: 'POST',
-      body: JSON.stringify({ topic, goal, agent_ids: selectedIds }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        topic,
+        goal: $('goal-input').value.trim(),
+        agent_ids: agentIds,
+        discussion_mode: $('mode-select').value,
+      }),
     });
-    closeModal();
-    await switchRoom(room.id);
-  } catch (err) {
-    alert('创建失败：' + err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '开始讨论';
-  }
+    if (!r.ok) { const e = await r.json(); alert(e.detail || '创建失败'); return; }
+    const room = await r.json();
+    closeNewRoomModal();
+    currentRoomId = room.id;
+    currentRoomStatus = room.status;
+    clearMessages();
+    updateRoomMeta(room);
+    buildTargetAgentSelect(room.agent_ids);
+    // Pre-render sidebar with selected agents
+    const selected = {};
+    agentIds.forEach(aid => { if (allAgents[aid]) selected[aid] = allAgents[aid]; });
+    renderRoomAgentSidebar(selected);
+    updateControlsForStatus(room.status);
+    loadRoomList();
+  } catch (e) { alert('创建失败：' + e); }
 }
 
-// ── 切换 / 加载房间 ───────────────────────────────────────────
-async function switchRoom(roomId) {
-  // 停止旧 SSE
-  if (activeSSE) { activeSSE.close(); activeSSE = null; }
-
-  currentRoomId = roomId;
-  const room = await api(`/api/rooms/${roomId}`);
-
-  // 顶栏
-  $('room-topic').textContent = room.topic;
-  $('room-goal').textContent = room.goal ? `目标：${room.goal}` : '';
-  setProgress(0, 0);
-
-  // 侧边栏 agents
-  renderAgentSidebar(room.agent_ids || []);
-
-  // 清空消息区
-  $('messages').innerHTML = '';
-
-  // 如果已完成，加载历史消息
-  if (room.status === 'done') {
-    const msgs = await api(`/api/rooms/${roomId}/messages`);
-    msgs.forEach(renderMessage);
-    const artifacts = await api(`/api/rooms/${roomId}/artifacts`);
-    artifacts.forEach(a => renderArtifact(a.content, a.id));
-    addSystemMsg('讨论已结束');
-    setInputEnabled(false);
-    return;
-  }
-
-  // 开始 SSE 流
-  setInputEnabled(true);
-  startSSE(roomId);
-
-  // 更新历史房间列表
-  await loadHistoryRooms();
+/* ── Room lifecycle controls ─────────────────────────────────── */
+function startDiscussion() {
+  if (!currentRoomId) return;
+  connectSSE(currentRoomId);
 }
 
-// ── SSE ───────────────────────────────────────────────────────
-function startSSE(roomId) {
-  const es = new EventSource(`/api/rooms/${roomId}/stream`);
-  activeSSE = es;
+async function pauseDiscussion() {
+  if (!currentRoomId) return;
+  await fetch(`/api/rooms/${currentRoomId}/pause`, { method: 'POST' });
+  currentRoomStatus = 'paused';
+  updateControlsForStatus('paused');
+}
 
-  es.onmessage = e => {
-    let evt;
-    try { evt = JSON.parse(e.data); } catch (_) { return; }
-    handleEvent(evt);
+async function resumeDiscussion() {
+  if (!currentRoomId) return;
+  const r = await fetch(`/api/rooms/${currentRoomId}/resume`, { method: 'POST' });
+  if (!r.ok) return;
+  connectSSE(currentRoomId);
+}
+
+async function stopDiscussion() {
+  if (!currentRoomId) return;
+  if (!confirm('停止当前讨论？')) return;
+  await fetch(`/api/rooms/${currentRoomId}/stop`, { method: 'POST' });
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  currentRoomStatus = 'done';
+  updateControlsForStatus('done');
+  loadRoomList();
+}
+
+async function summarizeDiscussion() {
+  if (!currentRoomId) return;
+  appendSystemMsg('正在生成总结…');
+  $('btn-summarize').disabled = true;
+  try {
+    const r = await fetch(`/api/rooms/${currentRoomId}/synthesize`, { method: 'POST' });
+    if (!r.ok) { const e = await r.json(); appendSystemMsg('总结失败：' + (e.detail || '')); return; }
+    const data = await r.json();
+    renderArtifact({ artifact_id: data.artifact_id, content: data.content, artifact_type: 'report' });
+    currentRoomStatus = 'done';
+    updateControlsForStatus('done');
+    updateChecklist({ summary_ready: true });
+    loadRoomList();
+  } catch (e) { appendSystemMsg('总结失败：' + e); }
+}
+
+function updateControlsForStatus(status) {
+  currentRoomStatus = status;
+  const badge = $('room-status-badge');
+  badge.textContent = statusLabel(status);
+  badge.className = `badge badge-${statusClass(status)}`;
+
+  $('btn-start').disabled     = status !== 'ready';
+  $('btn-pause').disabled     = status !== 'running';
+  $('btn-resume').disabled    = status !== 'paused';
+  $('btn-stop').disabled      = !['running', 'paused'].includes(status);
+  $('btn-summarize').disabled = !currentRoomId || ['ready', 'done'].includes(status);
+  const inputActive = ['running', 'paused'].includes(status);
+  $('user-input').disabled           = !inputActive;
+  $('send-btn').disabled             = !inputActive;
+  $('target-agent-select').disabled  = !inputActive;
+}
+
+/* ── SSE connection ──────────────────────────────────────────── */
+function connectSSE(roomId) {
+  if (eventSource) { eventSource.close(); }
+  eventSource = new EventSource(`/api/rooms/${roomId}/stream`);
+
+  eventSource.onmessage = e => {
+    try { handleEvent(JSON.parse(e.data)); } catch { /* skip malformed */ }
   };
-
-  es.onerror = () => {
-    es.close();
-    activeSSE = null;
+  eventSource.onerror = () => {
+    appendSystemMsg('⚠ 连接断开');
+    eventSource.close();
+    eventSource = null;
   };
 }
 
 function handleEvent(evt) {
   switch (evt.type) {
     case 'system':
-      addSystemMsg(evt.content);
+      appendSystemMsg(evt.content);
       break;
-
     case 'agents':
+      allAgents = Object.assign({}, allAgents, evt.agents);
+      renderRoomAgentSidebar(evt.agents);
       break;
-
     case 'thinking':
-      // 并行模式：每个 agent 有独立的 thinking 指示器
+      updateAgentStatus(evt.agent_id, '思考中…', 'status-thinking');
       showThinkingFor(evt.agent_id, evt.agent_name, evt.avatar);
-      setAgentStatus(evt.agent_id, 'thinking');
       break;
-
     case 'thinking_done':
-      // 某个 agent 已回来，移除它的 thinking 指示器
+      updateAgentStatus(evt.agent_id, '已发言', 'status-done');
       removeThinkingFor(evt.agent_id);
-      setAgentStatus(evt.agent_id, 'idle');
       break;
-
+    case 'message':
+      removeThinkingFor(evt.agent_id);
+      appendMessage(evt);
+      if (evt.agent_id !== 'user') {
+        updateAgentStatus(evt.agent_id, '已发言', 'status-done');
+      }
+      break;
     case 'round_start':
       addRoundSeparator(evt.round);
+      document.querySelectorAll('[id^="agent-status-"]').forEach(el => {
+        el.textContent = '待机';
+        el.className = 'agent-row-status dim';
+      });
       break;
-
-    case 'message':
-      removeThinkingFor(evt.agent_id);  // 兜底：确保消息前思考泡消失
-      renderMessage(evt);
-      setAgentStatus(evt.agent_id, 'idle');
-      break;
-
-    case 'user_message':
-      renderMessage({ ...evt, agent_id: 'user', agent_name: '你', avatar: '🧑' });
-      break;
-
-    case 'tool_call':
-      renderToolCall(evt);
-      break;
-
-    case 'tool_result':
-      renderToolResult(evt);
-      break;
-
     case 'goal_progress':
-      setProgress(evt.current, evt.target, evt.description);
+      updateProgress(evt);
       break;
-
     case 'synthesize_start':
-      removeAllThinking();
-      addSystemMsg('正在生成讨论总结…');
+      appendSystemMsg('📋 正在综合讨论成果…');
+      updateControlsForStatus('synthesizing');
       break;
-
     case 'artifact':
-      renderArtifact(evt.content, evt.artifact_id);
+      renderArtifact(evt);
+      updateChecklist({ summary_ready: true });
       break;
-
     case 'done':
       removeAllThinking();
-      addSystemMsg(`讨论结束（共 ${evt.turns} 轮）`);
-      setInputEnabled(false);
-      loadHistoryRooms();
+      appendSystemMsg('✅ 讨论完成，共 ' + evt.turns + ' 轮');
+      currentRoomStatus = 'done';
+      updateControlsForStatus('done');
+      loadRoomList();
+      if (eventSource) { eventSource.close(); eventSource = null; }
       break;
-
-    case 'goal_achieved':
-      addSystemMsg(`目标达成：${evt.message || ''}`);
-      break;
-
     case 'error':
-      addSystemMsg(`⚠ ${evt.content}`);
+      removeAllThinking();
+      appendSystemMsg('❌ ' + evt.content);
       break;
   }
-
-  scrollToBottom();
-}
-
-// ── 消息渲染 ──────────────────────────────────────────────────
-function renderMessage(msg) {
-  const isUser = msg.agent_id === 'user';
-  const div = document.createElement('div');
-  div.className = `msg${isUser ? ' user-msg' : ''}`;
-  div.dataset.agentId = msg.agent_id;
-
-  const avatar = esc(msg.avatar || agentsCache[msg.agent_id]?.avatar || '🤖');
-  const name = esc(msg.agent_name || msg.agent_id);
-  const content = esc(msg.content || '');
-  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-
-  div.innerHTML = `
-    <div class="msg-avatar">${avatar}</div>
-    <div class="msg-body">
-      <div class="msg-header">
-        <span class="msg-name">${name}</span>
-        <span class="msg-time">${time}</span>
-      </div>
-      <div class="msg-content">${content}</div>
-    </div>`;
-
-  $('messages').appendChild(div);
-}
-
-function renderToolCall(evt) {
-  const block = document.createElement('div');
-  block.className = 'msg';
-  block.id = `tc-${evt.agent_id}-${Date.now()}`;
-  block.dataset.agentId = evt.agent_id;
-
-  const inputStr = typeof evt.tool_input === 'object'
-    ? JSON.stringify(evt.tool_input, null, 2)
-    : String(evt.tool_input || '');
-
-  block.innerHTML = `
-    <div class="msg-avatar">${esc(evt.avatar || '🔧')}</div>
-    <div class="msg-body" style="max-width:80%">
-      <div class="tool-block">
-        <div class="tool-header" onclick="toggleTool(this)">
-          <span class="tool-icon">🔧</span>
-          <span class="tool-name">${esc(evt.tool_name)}</span>
-          <span class="msg-name" style="margin-left:4px;font-size:11px;color:var(--text-dim)">${esc(evt.agent_name)}</span>
-          <span class="tool-toggle">▶ 展开</span>
-        </div>
-        <div class="tool-body">
-          <div class="tool-section-label">输入</div>
-          <pre>${esc(inputStr)}</pre>
-        </div>
-      </div>
-    </div>`;
-
-  $('messages').appendChild(block);
-  // 存 id 供 tool_result 追加
-  block._toolName = evt.tool_name;
-}
-
-function renderToolResult(evt) {
-  // 找最近的 tool_call 块追加结果
-  const allBlocks = [...$('messages').querySelectorAll('.tool-block')];
-  const lastBlock = allBlocks[allBlocks.length - 1];
-  if (lastBlock) {
-    const body = lastBlock.querySelector('.tool-body');
-    if (body) {
-      const resDiv = document.createElement('div');
-      resDiv.innerHTML = `
-        <div class="tool-section-label">结果</div>
-        <pre>${esc(String(evt.content || '').slice(0, 800))}</pre>`;
-      body.appendChild(resDiv);
+  // Keep status badge in sync during active stream
+  if (['system','thinking','message','round_start'].includes(evt.type)
+      && currentRoomStatus !== 'done' && currentRoomStatus !== 'synthesizing') {
+    if (currentRoomStatus !== 'running') {
+      currentRoomStatus = 'running';
+      updateControlsForStatus('running');
     }
   }
 }
 
-function toggleTool(header) {
-  const body = header.nextElementSibling;
-  const toggle = header.querySelector('.tool-toggle');
-  body.classList.toggle('open');
-  toggle.textContent = body.classList.contains('open') ? '▼ 收起' : '▶ 展开';
-}
-
-function renderArtifact(content, artifactId) {
-  const div = document.createElement('div');
-  div.className = 'msg';
-  div.innerHTML = `
-    <div class="msg-avatar">📄</div>
-    <div class="msg-body" style="max-width:90%">
-      <div class="artifact-block">
-        <div class="artifact-header">
-          <span class="artifact-title">讨论总结</span>
-          ${artifactId
-            ? `<a class="artifact-download" href="/api/artifacts/${artifactId}/download" download>⬇ 下载</a>`
-            : ''}
-        </div>
-        <div class="artifact-content">${esc(content)}</div>
-      </div>
-    </div>`;
-  $('messages').appendChild(div);
-}
-
-// ── thinking 指示器（并行：每个 agent 独立） ───────────────────
+/* ── Thinking indicators ─────────────────────────────────────── */
 function showThinkingFor(agentId, agentName, avatar) {
-  const existingId = `thinking-${agentId}`;
-  if (document.getElementById(existingId)) return;  // 已经在显示
-
+  const eid = `thinking-${agentId}`;
+  if (document.getElementById(eid)) return;
   const div = document.createElement('div');
-  div.id = existingId;
+  div.id = eid;
   div.className = 'msg thinking-row';
-  div.innerHTML = `
-    <div class="msg-avatar">${esc(avatar || agentsCache[agentId]?.avatar || '🤖')}</div>
-    <div class="msg-body">
-      <div class="thinking-msg">
-        <span class="msg-name">${esc(agentName)}</span> 正在思考
-        <span class="thinking-dots"><span>·</span><span>·</span><span>·</span></span>
-      </div>
-    </div>`;
-  $('messages').appendChild(div);
-  scrollToBottom();
+  div.innerHTML =
+    `<div class="msg-avatar">${avatar || '🤖'}</div>` +
+    `<div class="msg-body">` +
+      `<div class="msg-name">${escHtml(agentName)}</div>` +
+      `<div class="thinking-dots"><span></span><span></span><span></span></div>` +
+    `</div>`;
+  appendToMessages(div);
 }
-
 function removeThinkingFor(agentId) {
   const el = document.getElementById(`thinking-${agentId}`);
   if (el) el.remove();
-  const card = $(`agent-card-${agentId}`);
-  card?.classList.remove('active');
 }
-
 function removeAllThinking() {
   document.querySelectorAll('.thinking-row').forEach(el => el.remove());
-  document.querySelectorAll('.agent-card').forEach(c => c.classList.remove('active'));
 }
 
-// ── 轮次分隔线 ────────────────────────────────────────────────
+/* ── Messages ────────────────────────────────────────────────── */
+function appendMessage(msg) {
+  if (!msg.content) return;
+  const isUser = msg.agent_id === 'user';
+  const div = document.createElement('div');
+  div.className = 'msg' + (isUser ? ' msg-user' : '');
+  if (isUser) {
+    div.innerHTML =
+      `<div class="msg-body user-bubble">${escHtml(msg.content)}</div>` +
+      `<div class="msg-avatar">🧑</div>`;
+  } else {
+    div.innerHTML =
+      `<div class="msg-avatar">${escHtml(msg.avatar || '🤖')}</div>` +
+      `<div class="msg-body">` +
+        `<div class="msg-name">${escHtml(msg.agent_name)}</div>` +
+        `<div class="msg-content">${escHtml(msg.content)}</div>` +
+      `</div>`;
+  }
+  appendToMessages(div);
+}
+
+function appendHistoryMessage(m) {
+  if (m.message_type === 'system') { appendSystemMsg(m.content); return; }
+  appendMessage({ agent_id: m.agent_id, agent_name: m.agent_name,
+                  avatar: m.avatar, content: m.content });
+}
+
+function appendSystemMsg(text) {
+  if (!text) return;
+  const div = document.createElement('div');
+  div.className = 'system-msg';
+  div.textContent = text;
+  appendToMessages(div);
+}
+
 function addRoundSeparator(round) {
   const div = document.createElement('div');
   div.className = 'round-separator';
   div.innerHTML = `<span>第 ${round} 轮</span>`;
-  $('messages').appendChild(div);
+  appendToMessages(div);
 }
 
-// ── 系统消息 ──────────────────────────────────────────────────
-function addSystemMsg(text) {
-  const div = document.createElement('div');
-  div.className = 'system-msg';
-  div.textContent = text;
-  $('messages').appendChild(div);
+function appendToMessages(el) {
+  const container = $('messages');
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
 }
 
-// ── Agent 侧边栏 ──────────────────────────────────────────────
-function renderAgentSidebar(agentIds) {
-  const container = $('agent-list');
-  container.innerHTML = '';
-  agentIds.forEach(id => {
-    const a = agentsCache[id];
+function clearMessages() { $('messages').innerHTML = ''; }
+
+/* ── Artifact / summary ──────────────────────────────────────── */
+function renderArtifact(art) {
+  const container = $('messages');
+  const prev = container.querySelector('.artifact-card');
+  if (prev) prev.remove();
+
+  const card = document.createElement('div');
+  card.className = 'artifact-card';
+  const downloadLink = art.artifact_id
+    ? `<a class="artifact-download" href="/api/artifacts/${art.artifact_id}/download" target="_blank">下载</a>`
+    : '';
+  card.innerHTML =
+    `<div class="artifact-header"><span>📄 讨论总结</span>${downloadLink}</div>` +
+    `<div class="artifact-body">${markdownToHtml(art.content || '')}</div>`;
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+}
+
+function markdownToHtml(md) {
+  const lines = md.split('\n');
+  let html = '';
+  let inList = false;
+  lines.forEach(line => {
+    if (line.startsWith('## ')) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += `<div class="art-section-title">${escHtml(line.slice(3))}</div>`;
+    } else if (/^(\d+\.|-)\s/.test(line.trim())) {
+      if (!inList) { html += '<ul class="art-list">'; inList = true; }
+      html += `<li>${escHtml(line.replace(/^(\d+\.|-)\s*/, ''))}</li>`;
+    } else {
+      if (inList) { html += '</ul>'; inList = false; }
+      if (line.trim()) html += `<p class="art-p">${escHtml(line)}</p>`;
+    }
+  });
+  if (inList) html += '</ul>';
+  return html;
+}
+
+/* ── Progress / checklist ────────────────────────────────────── */
+function updateProgress(evt) {
+  const ck = evt.checklist;
+  if (!ck) return;
+  updateChecklist(ck);
+
+  const boolKeys = ['problem_defined','risks_identified','tradeoffs_discussed','next_actions_ready','summary_ready'];
+  const done = boolKeys.filter(k => ck[k]).length + (ck.solutions_count > 0 ? 1 : 0);
+  const total = boolKeys.length + 1;
+  const pct = Math.round((done / total) * 100);
+  $('progress-fill').style.width = pct + '%';
+  $('progress-label').textContent = pct + '%';
+
+  if (evt.description) {
+    $('goal-text').textContent = evt.description;
+    $('goal-text').classList.remove('dim');
+  }
+}
+
+function updateChecklist(ck) {
+  setCheck('ck-problem',   ck.problem_defined);
+  setCheck('ck-risks',     ck.risks_identified);
+  setCheck('ck-tradeoffs', ck.tradeoffs_discussed);
+  setCheck('ck-actions',   ck.next_actions_ready);
+  setCheck('ck-summary',   ck.summary_ready);
+  if (ck.solutions_count !== undefined) {
+    $('ck-solutions-count').textContent = ck.solutions_count;
+    setCheck('ck-solutions', ck.solutions_count > 0);
+  }
+}
+
+function setCheck(id, done) {
+  const el = $(id);
+  if (!el) return;
+  const icon = el.querySelector('.ck-icon');
+  el.classList.toggle('ck-done', !!done);
+  if (icon) icon.textContent = done ? '✓' : '○';
+}
+
+/* ── User input ──────────────────────────────────────────────── */
+async function sendMessage() {
+  const content = $('user-input').value.trim();
+  if (!content || !currentRoomId) return;
+  const target = $('target-agent-select').value;
+  $('user-input').value = '';
+  autoResize($('user-input'));
+
+  // Show immediately in UI
+  appendMessage({ agent_id: 'user', agent_name: '你', avatar: '🧑', content });
+
+  try {
+    await fetch(`/api/rooms/${currentRoomId}/inject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, target_agent_id: target }),
+    });
+  } catch (e) { appendSystemMsg('发送失败：' + e); }
+}
+
+function buildTargetAgentSelect(agentIds) {
+  const sel = $('target-agent-select');
+  sel.innerHTML = '<option value="">全体专家</option>';
+  (agentIds || []).forEach(aid => {
+    const a = allAgents[aid];
     if (!a) return;
-    const card = document.createElement('div');
-    card.className = 'agent-card';
-    card.id = `agent-card-${id}`;
-    card.innerHTML = `
-      <div class="agent-avatar">${esc(a.avatar || '🤖')}</div>
-      <div class="agent-info">
-        <div class="agent-name">${esc(a.name)}</div>
-        <div class="agent-role">${esc(a.identity || '')}</div>
-      </div>
-      <div class="agent-status" id="agent-status-${id}">待机</div>`;
-    container.appendChild(card);
+    const opt = document.createElement('option');
+    opt.value = aid;
+    opt.textContent = (a.avatar || '🤖') + ' ' + a.name;
+    sel.appendChild(opt);
   });
 }
 
-function setAgentStatus(agentId, status) {
-  const el = $(`agent-status-${agentId}`);
-  const card = $(`agent-card-${agentId}`);
-  if (!el) return;
-  if (status === 'thinking') {
-    el.className = 'agent-status thinking';
-    el.textContent = '思考中…';
-    card?.classList.add('active');
-  } else {
-    el.className = 'agent-status';
-    el.textContent = '待机';
-    card?.classList.remove('active');
-  }
+/* ── Room meta display ───────────────────────────────────────── */
+function updateRoomMeta(room) {
+  $('room-title').textContent = room.topic;
+  $('goal-text').textContent = room.goal || '自由讨论';
+  $('goal-text').classList.toggle('dim', !room.goal);
 }
 
-// ── 进度条 ────────────────────────────────────────────────────
-function setProgress(current, target, desc) {
-  const pct = target > 0 ? Math.min(100, Math.round(current / target * 100)) : 0;
-  $('progress-fill').style.width = pct + '%';
-  $('progress-label').textContent = desc || (target > 0 ? `${current} / ${target}` : '进度');
-}
-
-// ── 用户插话 ──────────────────────────────────────────────────
-async function sendUserMessage() {
-  if (!currentRoomId) return;
-  const ta = $('user-input');
-  const content = ta.value.trim();
-  if (!content) return;
-
-  ta.value = '';
-  ta.style.height = '42px';
-
-  try {
-    await api(`/api/rooms/${currentRoomId}/inject`, {
-      method: 'POST',
-      body: JSON.stringify({ content }),
-    });
-  } catch (err) {
-    addSystemMsg('插话失败：' + err.message);
-  }
-}
-
-// ── 历史房间 ──────────────────────────────────────────────────
-async function loadHistoryRooms() {
-  try {
-    const rooms = await api('/api/rooms');
-    const container = $('history-rooms');
-    container.innerHTML = '';
-    rooms.slice(0, 10).forEach(r => {
-      const div = document.createElement('div');
-      div.className = `room-item${r.id === currentRoomId ? ' current' : ''}`;
-      div.textContent = r.topic.slice(0, 24);
-      div.title = r.topic;
-      div.addEventListener('click', () => switchRoom(r.id));
-      container.appendChild(div);
-    });
-  } catch (_) {}
-}
-
-// ── 工具函数 ──────────────────────────────────────────────────
-function setInputEnabled(enabled) {
-  $('user-input').disabled = !enabled;
-  $('send-btn').disabled = !enabled;
-}
-
-function scrollToBottom() {
-  const el = $('messages');
-  el.scrollTop = el.scrollHeight;
-}
-
-// 全局 toggleTool 供 onclick 调用
-window.toggleTool = toggleTool;
-
-// ── Agent 管理器 ───────────────────────────────────────────────
-let editingAgentId = null;   // null = 新建，string = 编辑现有
-
+/* ── Agent manager modal ─────────────────────────────────────── */
 function openAgentManager() {
-  editingAgentId = null;
-  showAgentListView();
+  showModal('agent-modal-overlay');
   loadAgentList();
-  $('agent-modal-overlay').classList.add('open');
 }
-
-function closeAgentManager() {
-  $('agent-modal-overlay').classList.remove('open');
-}
-
-function showAgentListView() {
-  $('agent-list-view').style.display = '';
-  $('agent-form-view').style.display = 'none';
-  $('agent-modal-title').textContent = '管理智能体';
-}
-
-function showAgentFormView(isNew) {
-  $('agent-list-view').style.display = 'none';
-  $('agent-form-view').style.display = '';
-  $('agent-modal-title').textContent = isNew ? '新建智能体' : '编辑智能体';
-}
+function closeAgentManager() { hideModal('agent-modal-overlay'); }
 
 async function loadAgentList() {
-  const container = $('agent-cards');
-  container.innerHTML = '<div style="color:var(--text-dim);padding:8px">加载中…</div>';
   try {
-    const agents = await api('/api/agents');
+    const r = await fetch('/api/agents');
+    const agents = await r.json();
+    allAgents = agents;
+    const container = $('agent-cards');
     container.innerHTML = '';
-    if (!Object.keys(agents).length) {
-      container.innerHTML = '<div style="color:var(--text-dim);padding:8px">暂无智能体</div>';
-      return;
-    }
-    for (const [id, a] of Object.entries(agents)) {
+    Object.entries(agents).forEach(([aid, a]) => {
       const card = document.createElement('div');
       card.className = 'agent-manage-card';
-      card.innerHTML = `
-        <span class="agent-manage-avatar">${esc(a.avatar || '🤖')}</span>
-        <div class="agent-manage-info">
-          <span class="agent-manage-name">${esc(a.name)}</span>
-          <span class="agent-manage-meta">${esc(a.identity || '')} · ${esc(a.backend || '')}</span>
-        </div>
-        <div class="agent-manage-actions">
-          <button class="btn-edit" data-id="${esc(id)}">编辑</button>
-          <button class="btn-delete" data-id="${esc(id)}">删除</button>
-        </div>`;
-      card.querySelector('.btn-edit').addEventListener('click', () => openEditAgent(id));
-      card.querySelector('.btn-delete').addEventListener('click', () => confirmDeleteAgent(id, a.name));
+      card.innerHTML =
+        `<span class="agent-manage-avatar">${a.avatar || '🤖'}</span>` +
+        `<div class="agent-manage-info">` +
+          `<strong>${escHtml(a.name)}</strong>` +
+          `<span class="dim">${escHtml(a.identity || a.expertise || '')}</span>` +
+          `<span class="dim">${a.backend}</span>` +
+        `</div>` +
+        `<div class="agent-manage-actions">` +
+          `<button class="btn-edit" onclick="openEditAgent('${aid}')">编辑</button>` +
+          `<button class="btn-delete" onclick="confirmDeleteAgent('${aid}')">删除</button>` +
+        `</div>`;
       container.appendChild(card);
-    }
-  } catch (err) {
-    container.innerHTML = `<div style="color:#f87171">加载失败：${esc(err.message)}</div>`;
-  }
+    });
+    showAgentList();
+  } catch { /* silent */ }
+}
+
+function showAgentList() {
+  $('agent-list-view').style.display = 'block';
+  $('agent-form-view').style.display = 'none';
+  $('agent-modal-title').textContent = '管理专家智能体';
 }
 
 async function openEditAgent(agentId) {
-  editingAgentId = agentId;
-  showAgentFormView(false);
-  // 加载详情
   try {
-    const data = await api(`/api/agents/${agentId}/detail`);
+    const r = await fetch(`/api/agents/${agentId}/detail`);
+    const d = await r.json();
     $('af-id').value = agentId;
     $('af-id').disabled = true;
-    $('af-id-note').textContent = 'ID 创建后不可修改';
-    $('af-name').value = data.name || '';
-    $('af-avatar').value = data.avatar || '';
-    $('af-backend').value = data.backend || 'hermes';
-    $('af-identity').value = data.identity || '';
-    $('af-expertise').value = data.expertise || '';
-    $('af-traits').value = (data.personality?.traits || []).join(', ');
-    $('af-tone').value = data.speaking_style?.tone || '';
-    $('af-goals').value = (data.goals?.public || []).join(', ');
-    $('af-memory').value = (data.memory?.long_term || []).join(', ');
-    $('af-enabled').checked = data.enabled !== false;
-  } catch (err) {
-    alert('加载失败：' + err.message);
-    showAgentListView();
-  }
+    $('af-id-note').textContent = '已有 ID 不可修改';
+    $('af-name').value = d.name || '';
+    $('af-avatar').value = d.avatar || '';
+    $('af-backend').value = d.backend || 'hermes';
+    $('af-identity').value = d.identity || '';
+    $('af-expertise').value = d.expertise || '';
+    $('af-traits').value = ((d.personality || {}).traits || []).join(', ');
+    $('af-tone').value = ((d.speaking_style || {}).tone) || '';
+    $('af-goals').value = ((d.goals || {}).public || []).join(', ');
+    $('af-memory').value = ((d.memory || {}).long_term || []).join(', ');
+    $('af-enabled').checked = d.enabled !== false;
+    $('agent-form-view')._editId = agentId;
+    $('agent-list-view').style.display = 'none';
+    $('agent-form-view').style.display = 'block';
+    $('agent-modal-title').textContent = '编辑：' + d.name;
+  } catch { /* silent */ }
 }
 
 function openNewAgent() {
-  editingAgentId = null;
-  showAgentFormView(true);
-  $('af-id').value = '';
+  ['af-id','af-name','af-avatar','af-identity','af-expertise','af-traits','af-tone','af-goals','af-memory']
+    .forEach(id => { $(id).value = ''; });
   $('af-id').disabled = false;
-  $('af-id-note').textContent = '例如：lawyer（仅字母/数字/下划线）';
-  $('af-name').value = '';
-  $('af-avatar').value = '';
+  $('af-id-note').textContent = '';
   $('af-backend').value = 'hermes';
-  $('af-identity').value = '';
-  $('af-expertise').value = '';
-  $('af-traits').value = '';
-  $('af-tone').value = '';
-  $('af-goals').value = '';
-  $('af-memory').value = '';
   $('af-enabled').checked = true;
-}
-
-function splitCSV(str) {
-  return str.split(',').map(s => s.trim()).filter(Boolean);
+  $('agent-form-view')._editId = null;
+  $('agent-list-view').style.display = 'none';
+  $('agent-form-view').style.display = 'block';
+  $('agent-modal-title').textContent = '新建专家';
 }
 
 async function saveAgent() {
-  const name = $('af-name').value.trim();
-  if (!name) { alert('请填写名称'); return; }
-
+  const editId = $('agent-form-view')._editId;
+  const agentId = editId || $('af-id').value.trim();
+  if (!agentId) { alert('请输入 ID'); return; }
   const payload = {
-    name,
+    name: $('af-name').value.trim() || agentId,
     avatar: $('af-avatar').value.trim() || '🤖',
     backend: $('af-backend').value,
     identity: $('af-identity').value.trim(),
@@ -612,47 +654,45 @@ async function saveAgent() {
     long_term: splitCSV($('af-memory').value),
     enabled: $('af-enabled').checked,
   };
-
-  const btn = $('af-save');
-  btn.disabled = true;
-  btn.textContent = '保存中…';
-
   try {
-    if (editingAgentId) {
-      await api(`/api/agents/${editingAgentId}`, {
-        method: 'PUT',
-        body: JSON.stringify(payload),
-      });
-    } else {
-      const agentId = $('af-id').value.trim();
-      if (!agentId) { alert('请填写 ID'); return; }
-      await api(`/api/agents?agent_id=${encodeURIComponent(agentId)}`, {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-    }
-    // 刷新配置缓存
-    await loadConfig();
-    showAgentListView();
-    loadAgentList();
-  } catch (err) {
-    alert('保存失败：' + err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '保存';
-  }
+    const url = editId
+      ? `/api/agents/${editId}`
+      : `/api/agents?agent_id=${encodeURIComponent(agentId)}`;
+    const method = editId ? 'PUT' : 'POST';
+    const r = await fetch(url, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) { const e = await r.json(); alert(e.detail || '保存失败'); return; }
+    await loadAgentList();
+    await loadAgents();
+  } catch (e) { alert('保存失败：' + e); }
 }
 
-async function confirmDeleteAgent(agentId, agentName) {
-  if (!confirm(`确认删除「${agentName}」？此操作不可撤销。`)) return;
+async function confirmDeleteAgent(agentId) {
+  if (!confirm('删除专家「' + agentId + '」？此操作不可撤销')) return;
   try {
-    await api(`/api/agents/${agentId}`, { method: 'DELETE' });
-    await loadConfig();
-    loadAgentList();
-  } catch (err) {
-    alert('删除失败：' + err.message);
-  }
+    await fetch(`/api/agents/${agentId}`, { method: 'DELETE' });
+    await loadAgentList();
+    await loadAgents();
+  } catch { /* silent */ }
 }
 
-// ── 启动 ───────────────────────────────────────────────────────
-init().catch(console.error);
+/* ── Utilities ───────────────────────────────────────────────── */
+function showModal(id)  { $(id).classList.remove('hidden'); }
+function hideModal(id)  { $(id).classList.add('hidden'); }
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function escAttr(s) { return escHtml(s); }
+function splitCSV(s) { return s.split(',').map(x => x.trim()).filter(Boolean); }
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
