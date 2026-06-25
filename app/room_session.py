@@ -137,6 +137,20 @@ class RoomSession:
             })
         self._seq = len(existing)
 
+        # Recover pending target: scan backwards for a user @mention that
+        # arrived after the last agent turn (i.e. injected with no active session)
+        for m in reversed(existing):
+            if m.agent_id == "user":
+                content = (m.content or "").strip()
+                if content.startswith("@"):
+                    candidate = content.split(None, 1)[0][1:]  # strip @
+                    if candidate in agents:
+                        self._pending_target = candidate
+                        break
+            elif m.agent_id not in ("system",):
+                # Hit an agent turn — any earlier user message was already acted on
+                break
+
         # Update room status to running
         room.status = "running"
         room.updated_at = datetime.utcnow()

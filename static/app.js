@@ -115,12 +115,13 @@ function renderRoomList(rooms) {
   el.innerHTML = '';
   if (!rooms.length) { el.innerHTML = '<div class="dim">暂无记录</div>'; return; }
   rooms.forEach(room => {
+    const es = effectiveStatus(room.status, room.active_session || false);
     const item = document.createElement('div');
     item.className = 'room-item' + (room.id === currentRoomId ? ' active' : '');
     item.innerHTML =
       `<div class="room-item-topic">${escHtml(room.topic)}</div>` +
       `<div class="room-item-meta">` +
-        `<span class="badge badge-${statusClass(room.status)}">${statusLabel(room.status)}</span>` +
+        `<span class="badge badge-${statusClass(es)}">${statusLabel(es)}</span>` +
         `<span class="dim">${room.turn_count} 轮</span>` +
       `</div>`;
     item.addEventListener('click', () => openRoom(room.id));
