@@ -83,6 +83,7 @@ class RoomSession:
         self._pause_event.set()  # not paused initially
         self._seq = 0
         self._pending_target: str = ""  # agent_id to speak next, if user steered
+        self._cancelled: bool = False   # P0: set on stop; prevents DB writes after /stop
 
     # ── Public interface ──────────────────────────────────────
 
@@ -90,6 +91,7 @@ class RoomSession:
         await self._user_queue.put((content, target_agent_id))
 
     def stop(self) -> None:
+        self._cancelled = True  # P0: mark before unblocking threads
         self._stop_event.set()
         self._pause_event.set()  # unblock any waiting pause
 
@@ -255,6 +257,8 @@ class RoomSession:
                 for fut in asyncio.as_completed(tasks):
                     a_id, agent, result, err = await fut
                     yield self._evt("thinking_done", agent_id=a_id)
+                    if self._cancelled:
+                        continue  # P0: discard — session stopped while thread ran
                     if err:
                         err_msg = self._save_msg(a_id, agent.name, "system",
                                                  f"（调用失败：{err}）", avatar=agent.avatar)
@@ -287,22 +291,31 @@ class RoomSession:
                 try:
                     result = await asyncio.to_thread(self._call_adapter, agent, prompt)
                     yield self._evt("thinking_done", agent_id=a_id)
-                    text = (result.text or "").strip()
-                    if text:
-                        msg = self._save_msg(a_id, agent.name, "text", text,
-                                             avatar=agent.avatar)
-                        round_responses.append({
-                            "agent_id": a_id, "agent_name": agent.name,
-                            "message_type": "text", "content": text,
-                        })
-                        yield self._evt("message", **self._msg_dict(msg))
+                    if not self._cancelled:  # P0
+                        text = (result.text or "").strip()
+                        if text:
+                            msg = self._save_msg(a_id, agent.name, "text", text,
+                                                 avatar=agent.avatar)
+                            round_responses.append({
+                                "agent_id": a_id, "agent_name": agent.name,
+                                "message_type": "text", "content": text,
+                            })
+                            yield self._evt("message", **self._msg_dict(msg))
                 except Exception as exc:
                     yield self._evt("thinking_done", agent_id=a_id)
-                    err_msg = self._save_msg(a_id, agent.name, "system",
-                                             f"（调用失败：{exc}）", avatar=agent.avatar)
-                    yield self._evt("message", **self._msg_dict(err_msg))
+                    if not self._cancelled:  # P0
+                        err_msg = self._save_msg(a_id, agent.name, "system",
+                                                 f"（调用失败：{exc}）", avatar=agent.avatar)
+                        yield self._evt("message", **self._msg_dict(err_msg))
 
             history.extend(round_responses)
+
+            # P3: persist turn_count after each productive round
+            if round_responses:
+                room.turn_count += len(round_responses)
+                room.updated_at = datetime.utcnow()
+                self.db.add(room)
+                self.db.commit()
 
             progress = goal_tracker.check(history)
             yield self._evt("goal_progress", **progress.to_dict())
@@ -313,9 +326,13 @@ class RoomSession:
             round_num += 1
             await asyncio.sleep(0)
 
+        # P0: if stopped by user, do not auto-synthesize
+        if self._cancelled:
+            return
+
         # ── Synthesize ────────────────────────────────────────
         yield self._evt("synthesize_start")
-        artifact_content = await self._synthesize(room.topic, room.goal or "", history)
+        artifact_content, is_mock = await self._synthesize(room.topic, room.goal or "", history)
         artifact = Artifact(
             room_id=self.room_id,
             artifact_type="report",
@@ -335,7 +352,8 @@ class RoomSession:
                         artifact_id=artifact.id,
                         artifact_type="report",
                         filename=artifact.filename,
-                        content=artifact_content)
+                        content=artifact_content,
+                        is_mock=is_mock)
         yield self._evt("done", turns=round_num)
 
     # ── Internals ─────────────────────────────────────────────
@@ -345,7 +363,7 @@ class RoomSession:
         adapter_config = config.get("adapters", {}).get(agent.backend, {})
         return create_adapter(agent.backend, adapter_config).run(prompt)
 
-    async def _synthesize(self, topic: str, goal: str, history: list[dict]) -> str:
+    async def _synthesize(self, topic: str, goal: str, history: list[dict]) -> tuple[str, bool]:
         return await synthesize_from_history(topic, goal, history)
 
     def _render_history(self, history: list[dict]) -> str:
@@ -386,7 +404,12 @@ class RoomSession:
 
 # ── Standalone synthesize (used by /synthesize endpoint) ──────
 
-async def synthesize_from_history(topic: str, goal: str, history: list[dict]) -> str:
+async def synthesize_from_history(
+    topic: str, goal: str, history: list[dict]
+) -> tuple[str, bool]:
+    """Return (content, is_mock).  is_mock=True means mock backend was used."""
+    import shutil as _shutil
+
     history_text = "\n".join(
         f"{m.get('agent_name', m.get('agent_id', '?'))}：{m.get('content', '')}"
         for m in history
@@ -397,15 +420,37 @@ async def synthesize_from_history(topic: str, goal: str, history: list[dict]) ->
         topic=topic, goal=goal or "自由讨论", history=history_text
     )
     config = get_config()
-    backend = config.get("synthesizer", {}).get("backend", "mock")
+    configured = config.get("synthesizer", {}).get("backend", "mock")
+    backend = configured
+
+    # P4: auto-upgrade from mock if a real CLI is available
+    if backend == "mock":
+        for candidate in ["hermes", "claude", "codex"]:
+            cfg = config.get("adapters", {}).get(candidate, {})
+            cmd = cfg.get("command", candidate)
+            if _shutil.which(cmd):
+                backend = candidate
+                break
+
+    is_mock = backend == "mock"
     adapter_config = config.get("adapters", {}).get(backend, {})
     try:
         result = await asyncio.to_thread(
             create_adapter(backend, adapter_config).run, prompt
         )
-        return result.text.strip() or "（综合生成为空）"
+        text = result.text.strip()
+        return (text or "（综合生成为空）", is_mock)
     except Exception as exc:
-        return f"（综合失败：{exc}）"
+        if not is_mock:
+            # Real backend failed — fall back to mock
+            try:
+                mock_result = await asyncio.to_thread(
+                    create_adapter("mock", {}).run, prompt
+                )
+                return (mock_result.text.strip() or "（综合生成为空）", True)
+            except Exception:
+                pass
+        return (f"（综合失败：{exc}）", True)
 
 
 def _mode_label(mode: str) -> str:

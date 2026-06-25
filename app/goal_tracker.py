@@ -48,8 +48,25 @@ class GoalTracker:
         self.target = self._parse_target(goal)
 
     def _parse_target(self, goal: str) -> int:
+        # Chinese: 5个建议 / 3条方案
         m = re.search(r"(\d+)\s*[个条点项份]", goal)
-        return int(m.group(1)) if m else 0
+        if m:
+            return int(m.group(1))
+        # English count noun: "3 ideas", "5 recommendations"
+        m = re.search(
+            r"(\d+)\s*(?:ideas?|recommendations?|options?|suggestions?|actions?|plans?|points?|examples?)",
+            goal, re.I,
+        )
+        if m:
+            return int(m.group(1))
+        # English verb + number: "generate 3", "list 5 options"
+        m = re.search(
+            r"(?:produce|generate|give|list|create|find|identify)\s+(\d+)",
+            goal, re.I,
+        )
+        if m:
+            return int(m.group(1))
+        return 0
 
     def check(self, history: list[dict]) -> GoalProgress:
         agent_msgs = [

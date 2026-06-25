@@ -203,6 +203,10 @@ a:hover { color: var(--accent-h); }
   font-weight: 600; font-size: 13px; border-bottom: 1px solid var(--border);
 }
 .artifact-download { font-size: 12px; color: var(--accent); }
+.artifact-mock-warn {
+  background: #3d2e05; color: #facc15; font-size: 12px;
+  padding: 5px 12px; border-bottom: 1px solid var(--border);
+}
 .artifact-body { padding: 10px 14px; font-size: 13px; line-height: 1.6; }
 .art-section-title {
   font-weight: 700; color: var(--accent); margin: 12px 0 6px;

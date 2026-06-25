@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from datetime import datetime
@@ -282,6 +283,7 @@ async def stop_room(room_id: int, db: Session = Depends(get_session)):
     session = get_session_if_exists(room_id)
     if session:
         session.stop()
+        remove_session(room_id)  # P0: evict immediately so _cancelled check takes effect
     room = db.get(Room, room_id)
     if room:
         room.status = "stopped"
@@ -298,6 +300,14 @@ async def synthesize_room(room_id: int, db: Session = Depends(get_session)):
     if not room:
         raise HTTPException(404, "room not found")
 
+    # P1: freeze — stop any active session before reading messages
+    active = get_session_if_exists(room_id)
+    if active:
+        active.stop()
+        remove_session(room_id)
+        await asyncio.sleep(1)  # grace period for in-flight adapter threads
+
+    # Read a stable snapshot from DB
     msgs = list(db.exec(
         select(Message).where(Message.room_id == room_id).order_by(Message.seq.asc())
     ))
@@ -307,7 +317,7 @@ async def synthesize_room(room_id: int, db: Session = Depends(get_session)):
         for m in msgs
     ]
 
-    content = await synthesize_from_history(room.topic, room.goal or "", history)
+    content, is_mock = await synthesize_from_history(room.topic, room.goal or "", history)
 
     # upsert artifact
     existing = db.exec(
@@ -338,7 +348,7 @@ async def synthesize_room(room_id: int, db: Session = Depends(get_session)):
     db.add(room)
     db.commit()
 
-    return {"artifact_id": artifact.id, "content": content}
+    return {"artifact_id": artifact.id, "content": content, "is_mock": is_mock}
 
 
 # ── SSE Stream ────────────────────────────────────────────────

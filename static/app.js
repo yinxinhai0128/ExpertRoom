@@ -294,7 +294,7 @@ async function summarizeDiscussion() {
     const r = await fetch(`/api/rooms/${currentRoomId}/synthesize`, { method: 'POST' });
     if (!r.ok) { const e = await r.json(); appendSystemMsg('总结失败：' + (e.detail || '')); return; }
     const data = await r.json();
-    renderArtifact({ artifact_id: data.artifact_id, content: data.content, artifact_type: 'report' });
+    renderArtifact({ artifact_id: data.artifact_id, content: data.content, artifact_type: 'report', is_mock: data.is_mock });
     currentActiveSession = false;
     updateControlsForStatus('done', false);
     updateChecklist({ summary_ready: true });
@@ -508,8 +508,12 @@ function renderArtifact(art) {
   const downloadLink = art.artifact_id
     ? `<a class="artifact-download" href="/api/artifacts/${art.artifact_id}/download" target="_blank">下载</a>`
     : '';
+  const mockWarn = art.is_mock
+    ? `<div class="artifact-mock-warn">⚠ 测试模式：总结由 mock 后端生成，非真实模型输出</div>`
+    : '';
   card.innerHTML =
     `<div class="artifact-header"><span>📄 讨论总结</span>${downloadLink}</div>` +
+    mockWarn +
     `<div class="artifact-body">${markdownToHtml(art.content || '')}</div>`;
   container.appendChild(card);
   container.scrollTop = container.scrollHeight;
