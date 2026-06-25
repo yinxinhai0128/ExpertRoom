@@ -1,0 +1,42 @@
+app:
+  name: ExpertRoom
+  host: 127.0.0.1
+  port: 8001
+  default_agents: [manong, jiaoshou, shanhe]
+
+moderator:
+  backend: mock       # mock | claude | hermes — 只路由，不产内容
+  max_turns: 200      # 安全上限，实际由 max_seconds 控制
+  max_seconds: 600    # 10 分钟后不再开始新的 agent 轮次，等当前的输出完
+
+synthesizer:
+  backend: mock       # mock | claude
+
+adapters:
+  mock:
+    enabled: true
+
+  claude:
+    enabled: true
+    command: claude.CMD
+    args: ["--output-format", "stream-json", "--verbose"]
+
+  hermes:
+    enabled: true
+    command: hermes.exe
+    # model: deepseek-v4-flash   # 留空则使用 hermes 自身配置的默认模型
+
+  openclaw:
+    enabled: true
+    distro: OpenClawGateway      # WSL 发行版名称
+    agent: main                  # openclaw agent id
+    model: deepseek/deepseek-v4-flash
+
+  codex:
+    enabled: true
+    command: codex
+    # model: gpt-5.5             # 留空则使用 ~/.codex/config.toml 的默认模型
+
+runtime:
+  agent_timeout: 120    # 单次 adapter 调用超时秒数
+  inject_poll_ms: 200   # 用户注入消息轮询间隔
