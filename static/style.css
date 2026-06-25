@@ -218,6 +218,7 @@ a:hover { color: var(--accent-h); }
 .badge-idle    { background: var(--surface2); color: var(--text-dim); }
 .badge-running { background: #1e3a5f; color: #60a5fa; }
 .badge-paused  { background: #3d2e05; color: var(--yellow); }
+.badge-stopped { background: #2e1e3d; color: #c084fc; }
 .badge-done    { background: #14352a; color: var(--green); }
 .badge-err     { background: #3d0f0f; color: var(--red); }
 

@@ -76,16 +76,18 @@ class RoomSession:
     def __init__(self, room_id: int, db: Session) -> None:
         self.room_id = room_id
         self.db = db
-        self._user_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Queue carries (content, target_agent_id) tuples
+        self._user_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
         self._pause_event.set()  # not paused initially
         self._seq = 0
+        self._pending_target: str = ""  # agent_id to speak next, if user steered
 
     # ── Public interface ──────────────────────────────────────
 
-    async def inject_user_message(self, content: str) -> None:
-        await self._user_queue.put(content)
+    async def inject_user_message(self, content: str, target_agent_id: str = "") -> None:
+        await self._user_queue.put((content, target_agent_id))
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -168,7 +170,7 @@ class RoomSession:
             user_inject_text = ""
             while True:
                 try:
-                    user_content = self._user_queue.get_nowait()
+                    user_content, target_id = self._user_queue.get_nowait()
                     user_msg = self._save_msg("user", "你", "text", user_content, avatar="🧑")
                     history.append({"agent_id": "user", "agent_name": "你",
                                      "message_type": "text", "content": user_content})
@@ -177,11 +179,21 @@ class RoomSession:
                         f"【用户刚才说】\n{user_content}\n"
                         "（可以回应，也可以继续自己的思路）\n\n"
                     )
+                    # Schedule the targeted agent for the next turn
+                    if target_id and target_id in agents:
+                        self._pending_target = target_id
                 except asyncio.QueueEmpty:
                     break
 
             # Select speaker(s) for this round
-            if discussion_mode == "panel":
+            # If user steered to a specific agent, honour it regardless of mode
+            if self._pending_target and self._pending_target in agents:
+                override = self._pending_target
+                self._pending_target = ""
+                speakers = [(override, agents[override])]
+                yield self._evt("system",
+                                content=f"🎯 用户指定 {agents[override].name} 发言")
+            elif discussion_mode == "panel":
                 speakers = list(agents.items())
             elif discussion_mode == "round_robin":
                 ids = list(agents.keys())

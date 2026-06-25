@@ -16,12 +16,14 @@ from sse_starlette.sse import EventSourceResponse
 from app.agent_loader import clear_agent_cache, load_all_agents
 from app.config_loader import ROOT_DIR, get_config
 from app.database import get_session, init_db
+from app.goal_tracker import GoalTracker
 from app.models import Artifact, Message, Room
 from app.room_session import (
     RoomSession,
     _sessions,
     get_session_if_exists,
     remove_session,
+    synthesize_from_history,
 )
 
 app = FastAPI(title="ExpertRoom")
@@ -175,6 +177,7 @@ def _room_dict(room: Room) -> dict:
         "discussion_mode": getattr(room, "discussion_mode", "panel"),
         "turn_count": room.turn_count,
         "created_at": room.created_at.isoformat(),
+        "active_session": room.id in _sessions,
     }
 
 
@@ -195,23 +198,49 @@ def get_artifacts(room_id: int, db: Session = Depends(get_session)):
              "filename": a.filename, "content": a.content} for a in arts]
 
 
+@app.get("/api/rooms/{room_id}/progress")
+def get_progress(room_id: int, db: Session = Depends(get_session)):
+    """Compute progress from stored messages — safe to call without an active session."""
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "room not found")
+    msgs = list(db.exec(
+        select(Message).where(Message.room_id == room_id).order_by(Message.seq.asc())
+    ))
+    history = [
+        {"agent_id": m.agent_id, "agent_name": m.agent_name,
+         "message_type": m.message_type, "content": m.content}
+        for m in msgs
+    ]
+    tracker = GoalTracker(room.goal or "")
+    progress = tracker.check(history)
+    result = progress.to_dict()
+    # Mark summary_ready if a report artifact exists
+    has_report = db.exec(
+        select(Artifact).where(
+            Artifact.room_id == room_id,
+            Artifact.artifact_type == "report",
+        )
+    ).first() is not None
+    result["checklist"]["summary_ready"] = has_report
+    return result
+
+
 # ── Room Lifecycle ────────────────────────────────────────────
 
-_STARTABLE = {"ready", "running", "paused"}
-_ACTIVE    = {"running", "paused"}
+# Statuses from which a new SSE stream can be opened
+_STARTABLE = {"ready", "running", "paused", "stopped"}
+_ACTIVE    = {"running", "paused", "stopped"}
 
 
 @app.post("/api/rooms/{room_id}/start")
 def start_room(room_id: int, db: Session = Depends(get_session)):
-    """Mark room as ready to stream. Actual discussion starts when client connects SSE."""
+    """Validate that a room can be streamed. Client connects SSE to stream_url next."""
     room = db.get(Room, room_id)
     if not room:
         raise HTTPException(404, "room not found")
     if room.status not in _STARTABLE:
         raise HTTPException(400, f"cannot start room with status '{room.status}'")
-    if room.status == "paused":
-        # resume handled by /resume
-        pass
     return {"ok": True, "stream_url": f"/api/rooms/{room_id}/stream"}
 
 
@@ -249,12 +278,13 @@ async def resume_room(room_id: int, db: Session = Depends(get_session)):
 
 @app.post("/api/rooms/{room_id}/stop")
 async def stop_room(room_id: int, db: Session = Depends(get_session)):
+    """Stop active generation. Room moves to 'stopped' so /synthesize can still be called."""
     session = get_session_if_exists(room_id)
     if session:
         session.stop()
     room = db.get(Room, room_id)
     if room:
-        room.status = "done"
+        room.status = "stopped"
         room.updated_at = datetime.utcnow()
         db.add(room)
         db.commit()
@@ -277,7 +307,6 @@ async def synthesize_room(room_id: int, db: Session = Depends(get_session)):
         for m in msgs
     ]
 
-    from app.room_session import synthesize_from_history
     content = await synthesize_from_history(room.topic, room.goal or "", history)
 
     # upsert artifact
@@ -357,10 +386,14 @@ async def inject_message(room_id: int, payload: InjectRequest,
     if room.status == "done":
         raise HTTPException(400, "room is already done")
 
+    target = payload.target_agent_id.strip()
+    # Prefix target into content so it's visible in history and readable by agents
+    display_content = f"@{target} {content}" if target else content
+
     session = get_session_if_exists(room_id)
     if session:
-        # Active session: let it save to DB (avoids double-save)
-        await session.inject_user_message(content)
+        # Active session: let it save to DB and handle target scheduling
+        await session.inject_user_message(display_content, target_agent_id=target)
     else:
         # No active session: save directly so message persists for next resume
         seq_result = db.exec(
@@ -370,7 +403,7 @@ async def inject_message(room_id: int, payload: InjectRequest,
         db.add(Message(
             room_id=room_id, seq=next_seq,
             agent_id="user", agent_name="你", agent_avatar="🧑",
-            message_type="text", content=content,
+            message_type="text", content=display_content,
         ))
         db.commit()
 

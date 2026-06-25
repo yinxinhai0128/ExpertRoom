@@ -1,6 +1,7 @@
 /* ── State ────────────────────────────────────────────────────── */
 let currentRoomId = null;
 let currentRoomStatus = null;
+let currentActiveSession = false;   // true only when an SSE stream is connected
 let eventSource = null;
 let allAgents = {};
 let adapterHealth = {};
@@ -128,14 +129,22 @@ function renderRoomList(rooms) {
 }
 
 function statusClass(s) {
-  const map = { ready:'idle', running:'running', paused:'paused',
-                synthesizing:'running', done:'done', failed:'err', error:'err' };
+  const map = { ready:'idle', running:'running', interrupted:'paused',
+                paused:'paused', stopped:'stopped', synthesizing:'running',
+                done:'done', failed:'err', error:'err' };
   return map[s] || 'idle';
 }
 function statusLabel(s) {
-  const map = { ready:'待开始', running:'进行中', paused:'已暂停',
-                synthesizing:'综合中', done:'已完成', failed:'失败', error:'错误' };
+  const map = { ready:'待开始', running:'进行中', interrupted:'可继续',
+                paused:'已暂停', stopped:'已停止', synthesizing:'综合中',
+                done:'已完成', failed:'失败', error:'错误' };
   return map[s] || s;
+}
+
+// Derive display status: "running" without active session = "interrupted"
+function effectiveStatus(status, activeSession) {
+  if (status === 'running' && !activeSession) return 'interrupted';
+  return status;
 }
 
 /* ── Open existing room ──────────────────────────────────────── */
@@ -146,6 +155,7 @@ async function openRoom(roomId) {
     const room = await r.json();
     currentRoomId = room.id;
     currentRoomStatus = room.status;
+    currentActiveSession = room.active_session || false;
     updateRoomMeta(room);
 
     const mr = await fetch(`/api/rooms/${roomId}/messages`);
@@ -155,14 +165,21 @@ async function openRoom(roomId) {
 
     buildTargetAgentSelect(room.agent_ids);
 
-    if (room.status === 'done') {
+    // Load artifact for done/stopped rooms
+    if (['done', 'stopped'].includes(room.status)) {
       const ar = await fetch(`/api/rooms/${roomId}/artifacts`);
       const arts = await ar.json();
       const report = arts.find(a => a.artifact_type === 'report');
       if (report) renderArtifact(report);
     }
 
-    updateControlsForStatus(room.status);
+    // Recalculate progress from stored messages
+    fetch(`/api/rooms/${roomId}/progress`)
+      .then(r => r.json())
+      .then(p => updateProgress(p))
+      .catch(() => {});
+
+    updateControlsForStatus(room.status, room.active_session || false);
     loadRoomList();
   } catch { /* silent */ }
 }
@@ -223,22 +240,31 @@ async function createRoom() {
     const selected = {};
     agentIds.forEach(aid => { if (allAgents[aid]) selected[aid] = allAgents[aid]; });
     renderRoomAgentSidebar(selected);
-    updateControlsForStatus(room.status);
+    updateControlsForStatus(room.status, false);
     loadRoomList();
   } catch (e) { alert('创建失败：' + e); }
 }
 
 /* ── Room lifecycle controls ─────────────────────────────────── */
-function startDiscussion() {
+async function startDiscussion() {
   if (!currentRoomId) return;
-  connectSSE(currentRoomId);
+  try {
+    const r = await fetch(`/api/rooms/${currentRoomId}/start`, { method: 'POST' });
+    if (!r.ok) {
+      const e = await r.json();
+      appendSystemMsg('❌ 无法启动：' + (e.detail || '未知错误'));
+      return;
+    }
+    connectSSE(currentRoomId);
+  } catch (e) { appendSystemMsg('❌ 启动失败：' + e); }
 }
 
 async function pauseDiscussion() {
   if (!currentRoomId) return;
   await fetch(`/api/rooms/${currentRoomId}/pause`, { method: 'POST' });
   currentRoomStatus = 'paused';
-  updateControlsForStatus('paused');
+  currentActiveSession = false;
+  updateControlsForStatus('paused', false);
 }
 
 async function resumeDiscussion() {
@@ -250,11 +276,12 @@ async function resumeDiscussion() {
 
 async function stopDiscussion() {
   if (!currentRoomId) return;
-  if (!confirm('停止当前讨论？')) return;
+  if (!confirm('停止当前讨论？停止后仍可生成总结。')) return;
   await fetch(`/api/rooms/${currentRoomId}/stop`, { method: 'POST' });
   if (eventSource) { eventSource.close(); eventSource = null; }
-  currentRoomStatus = 'done';
-  updateControlsForStatus('done');
+  currentRoomStatus = 'stopped';
+  currentActiveSession = false;
+  updateControlsForStatus('stopped', false);
   loadRoomList();
 }
 
@@ -267,40 +294,65 @@ async function summarizeDiscussion() {
     if (!r.ok) { const e = await r.json(); appendSystemMsg('总结失败：' + (e.detail || '')); return; }
     const data = await r.json();
     renderArtifact({ artifact_id: data.artifact_id, content: data.content, artifact_type: 'report' });
-    currentRoomStatus = 'done';
-    updateControlsForStatus('done');
+    currentActiveSession = false;
+    updateControlsForStatus('done', false);
     updateChecklist({ summary_ready: true });
     loadRoomList();
   } catch (e) { appendSystemMsg('总结失败：' + e); }
 }
 
-function updateControlsForStatus(status) {
+function updateControlsForStatus(status, activeSession) {
+  if (activeSession === undefined) activeSession = currentActiveSession;
   currentRoomStatus = status;
-  const badge = $('room-status-badge');
-  badge.textContent = statusLabel(status);
-  badge.className = `badge badge-${statusClass(status)}`;
+  currentActiveSession = activeSession;
 
-  $('btn-start').disabled     = status !== 'ready';
-  $('btn-pause').disabled     = status !== 'running';
-  $('btn-resume').disabled    = status !== 'paused';
-  $('btn-stop').disabled      = !['running', 'paused'].includes(status);
-  $('btn-summarize').disabled = !currentRoomId || ['ready', 'done'].includes(status);
-  const inputActive = ['running', 'paused'].includes(status);
-  $('user-input').disabled           = !inputActive;
-  $('send-btn').disabled             = !inputActive;
-  $('target-agent-select').disabled  = !inputActive;
+  const es = effectiveStatus(status, activeSession);
+  const badge = $('room-status-badge');
+  badge.textContent = statusLabel(es);
+  badge.className = `badge badge-${statusClass(es)}`;
+
+  // Start: first-time (ready) or re-enter (stopped / interrupted)
+  const canStart = ['ready', 'stopped', 'interrupted'].includes(es);
+  $('btn-start').disabled = !canStart;
+  $('btn-start').textContent = es === 'ready' ? '▶ 开始' : '▶ 继续';
+
+  // Pause: only when actually streaming
+  $('btn-pause').disabled = es !== 'running';
+
+  // Resume: only when paused (active session waiting)
+  $('btn-resume').disabled = es !== 'paused';
+
+  // Stop: when actively running or paused
+  $('btn-stop').disabled = !['running', 'paused'].includes(es);
+
+  // Summarize: any state where there could be messages, except ready/done/synthesizing
+  const canSummarize = currentRoomId && !['ready', 'done', 'synthesizing'].includes(es);
+  $('btn-summarize').disabled = !canSummarize;
+
+  // Input: usable whenever the room has started (messages persist durably)
+  const inputActive = ['running', 'paused', 'stopped', 'interrupted'].includes(es);
+  $('user-input').disabled          = !inputActive;
+  $('send-btn').disabled            = !inputActive;
+  $('target-agent-select').disabled = !inputActive;
 }
 
 /* ── SSE connection ──────────────────────────────────────────── */
 function connectSSE(roomId) {
   if (eventSource) { eventSource.close(); }
+  currentActiveSession = true;
+  updateControlsForStatus(currentRoomStatus || 'running', true);
   eventSource = new EventSource(`/api/rooms/${roomId}/stream`);
 
   eventSource.onmessage = e => {
     try { handleEvent(JSON.parse(e.data)); } catch { /* skip malformed */ }
   };
   eventSource.onerror = () => {
-    appendSystemMsg('⚠ 连接断开');
+    currentActiveSession = false;
+    if (currentRoomStatus !== 'done' && currentRoomStatus !== 'stopped') {
+      // Connection dropped unexpectedly — mark as interrupted
+      appendSystemMsg('⚠ 连接断开，讨论中断。可点「▶ 继续」恢复。');
+      updateControlsForStatus(currentRoomStatus || 'running', false);
+    }
     eventSource.close();
     eventSource = null;
   };
@@ -342,7 +394,7 @@ function handleEvent(evt) {
       break;
     case 'synthesize_start':
       appendSystemMsg('📋 正在综合讨论成果…');
-      updateControlsForStatus('synthesizing');
+      updateControlsForStatus('synthesizing', false);
       break;
     case 'artifact':
       renderArtifact(evt);
@@ -351,8 +403,8 @@ function handleEvent(evt) {
     case 'done':
       removeAllThinking();
       appendSystemMsg('✅ 讨论完成，共 ' + evt.turns + ' 轮');
-      currentRoomStatus = 'done';
-      updateControlsForStatus('done');
+      currentActiveSession = false;
+      updateControlsForStatus('done', false);
       loadRoomList();
       if (eventSource) { eventSource.close(); eventSource = null; }
       break;
@@ -364,9 +416,9 @@ function handleEvent(evt) {
   // Keep status badge in sync during active stream
   if (['system','thinking','message','round_start'].includes(evt.type)
       && currentRoomStatus !== 'done' && currentRoomStatus !== 'synthesizing') {
-    if (currentRoomStatus !== 'running') {
+    if (currentRoomStatus !== 'running' || !currentActiveSession) {
       currentRoomStatus = 'running';
-      updateControlsForStatus('running');
+      updateControlsForStatus('running', true);
     }
   }
 }
